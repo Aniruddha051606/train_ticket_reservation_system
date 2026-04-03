@@ -25,7 +25,7 @@ app.use('/pnr', limiter);
 app.use('/liveStatus', limiter);
 
 // ==========================================
-// 2. LOAD LOCAL TRAIN DATABASE (Offline Routing)
+// 2. LOAD LOCAL TRAIN DATABASE
 // ==========================================
 let localTrains = [];
 let localStationsMap = new Map();
@@ -55,8 +55,10 @@ mongoose.connect(process.env.MONGO_URI)
     .catch((err) => console.error('❌ MongoDB Connection Error:', err.message));
 
 const User = mongoose.model('User', new mongoose.Schema({
-    name: { type: String, required: true }, email: { type: String, required: true, unique: true },
-    password: { type: String, required: true }, createdAt: { type: Date, default: Date.now }
+    name: { type: String, required: true }, 
+    email: { type: String, required: true, unique: true },
+    password: { type: String, required: true }, 
+    createdAt: { type: Date, default: Date.now }
 }));
 
 const Ticket = mongoose.model('Ticket', new mongoose.Schema({
@@ -114,14 +116,11 @@ app.get('/searchTrains', async (req, res) => {
     
     let matchingTrains = [];
 
-    // 1. Map Offline Routes & Calculate Dynamic Price
     localTrains.forEach(train => {
         const sourceIndex = train.route.findIndex(s => s.stationCode === source);
         const destIndex = train.route.findIndex(s => s.stationCode === destination);
 
         if (sourceIndex !== -1 && destIndex !== -1 && sourceIndex < destIndex) {
-            
-            // Calculate dynamic price based on distance (stops)
             const numberOfStops = destIndex - sourceIndex;
             const dynamicPrice = 150 + (numberOfStops * 65); 
 
@@ -136,17 +135,13 @@ app.get('/searchTrains', async (req, res) => {
     if (matchingTrains.length === 0) return res.json([]);
 
     try {
-        // 2. Fetch REAL MongoDB Prices & Live Seat Inventory
         const realFares = await Fare.find({ fromStnCode: source, toStnCode: destination, classCode: 'SL' });
         
         for (let i = 0; i < matchingTrains.length; i++) {
             let train = matchingTrains[i];
-            
-            // Link Real Fare or fallback to our math-based dynamic price
             const exactFare = realFares.find(f => f.trainNumber === train.trainNumber);
             train.price = exactFare ? exactFare.totalFare : train.price;
 
-            // 🔍 CHECK LIVE ACTUAL INVENTORY
             let inventory = await SeatInventory.findOne({ trainNumber: train.trainNumber, date: date });
 
             if (!inventory) {
@@ -169,6 +164,7 @@ app.get('/searchTrains', async (req, res) => {
 
         res.json(matchingTrains);
     } catch (error) {
+        console.error("Search Error:", error);
         res.json(matchingTrains); 
     }
 });
@@ -203,7 +199,9 @@ app.get('/pnr', async (req, res) => {
         });
         if (response.data?.data) res.json(response.data.data);
         else res.status(404).json({ error: "PNR details not found." });
-    } catch (error) { res.status(500).json({ error: "Failed to fetch PNR status." }); }
+    } catch (error) { 
+        res.status(500).json({ error: "Failed to fetch PNR status." }); 
+    }
 });
 
 // ==========================================
@@ -214,20 +212,17 @@ app.post('/bookTicket', verifyToken, async (req, res) => {
         const { trainNumber, trainName, source, destination, date, passengers, totalPrice } = req.body;
         const count = passengers.length;
 
-        // 1. Safely subtract seats from Inventory (Atomic)
         const inventory = await SeatInventory.findOneAndUpdate(
             { trainNumber, date },
             { $inc: { availableSeats: -count } }, 
             { new: true, upsert: true }
         );
 
-        // 2. Check if they fell into the waitlist
         let finalStatus = "CONFIRMED";
         if (inventory.availableSeats < 0) {
             finalStatus = "WAITLIST";
         }
 
-        // 3. Generate PNR & Assign Seats
         const generatedPnr = Math.floor(1000000000 + Math.random() * 9000000000).toString();
         const coachTypes = ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'B1', 'B2'];
         
@@ -236,7 +231,6 @@ app.post('/bookTicket', verifyToken, async (req, res) => {
             seatNumber: finalStatus === "CONFIRMED" ? `${coachTypes[Math.floor(Math.random() * coachTypes.length)]} - ${Math.floor(Math.random() * 72) + 1}` : "WAITLIST"
         }));
 
-        // 4. Save Final Ticket
         const newTicket = await new Ticket({ 
             userId: req.userId, 
             trainNumber, trainName, source, destination, date, 
@@ -247,6 +241,7 @@ app.post('/bookTicket', verifyToken, async (req, res) => {
 
         res.status(201).json({ message: "Booked Successfully!", pnr: generatedPnr, status: finalStatus, ticket: newTicket });
     } catch (error) { 
+        console.error("Booking Error:", error);
         res.status(500).json({ error: "Booking Failed." }); 
     }
 });
@@ -255,7 +250,9 @@ app.get('/myTickets', verifyToken, async (req, res) => {
     try {
         const tickets = await Ticket.find({ userId: req.userId }).sort({ bookingDate: -1 });
         res.json(tickets);
-    } catch (error) { res.status(500).json({ error: "Failed to fetch tickets." }); }
+    } catch (error) { 
+        res.status(500).json({ error: "Failed to fetch tickets." }); 
+    }
 });
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -267,7 +264,10 @@ app.post('/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, await bcrypt.genSalt(10));
         await new User({ name, email, password: hashedPassword }).save();
         res.status(201).json({ message: "Success." });
-    } catch (e) { res.status(500).json({ error: "Error." }); }
+    } catch (e) { 
+        console.error("Register Error:", e);
+        res.status(500).json({ error: "Internal Error." }); 
+    }
 });
 
 app.post('/login', async (req, res) => {
@@ -277,8 +277,13 @@ app.post('/login', async (req, res) => {
         if (user && await bcrypt.compare(password, user.password)) {
             const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
             res.json({ token, user: { name: user.name, email: user.email } });
-        } else { res.status(401).json({ error: "Invalid credentials." }); }
-    } catch (e) { res.status(500).json({ error: "Error." }); }
+        } else { 
+            res.status(401).json({ error: "Invalid credentials." }); 
+        }
+    } catch (e) { 
+        console.error("Login Error:", e);
+        res.status(500).json({ error: "Internal Error." }); 
+    }
 });
 
 app.post('/auth/google', async (req, res) => {
