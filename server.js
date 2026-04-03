@@ -205,21 +205,32 @@ app.get('/pnr', async (req, res) => {
 });
 
 // ==========================================
-// 5. ADVANCED BOOKING & AUTH ROUTES
+// 5. ADVANCED BOOKING ENGINE (FAANG LEVEL)
 // ==========================================
 app.post('/bookTicket', verifyToken, async (req, res) => {
+    // 🌟 FAANG FEATURE: MongoDB Session for ACID Transactions
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
     try {
         const { trainNumber, trainName, source, destination, date, passengers, totalPrice } = req.body;
         const count = passengers.length;
 
+        // 🔒 LOCKING INVENTORY to prevent Race Conditions (Double Bookings)
         const inventory = await SeatInventory.findOneAndUpdate(
             { trainNumber, date },
             { $inc: { availableSeats: -count } }, 
-            { new: true, upsert: true }
+            { new: true, upsert: true, session }
         );
 
         let finalStatus = "CONFIRMED";
+        
         if (inventory.availableSeats < 0) {
+            if (inventory.availableSeats < -20) {
+                await session.abortTransaction(); // Too full, roll back seat deduction
+                session.endSession();
+                return res.status(400).json({ error: "REGRET: Train is completely full." });
+            }
             finalStatus = "WAITLIST";
         }
 
@@ -231,21 +242,105 @@ app.post('/bookTicket', verifyToken, async (req, res) => {
             seatNumber: finalStatus === "CONFIRMED" ? `${coachTypes[Math.floor(Math.random() * coachTypes.length)]} - ${Math.floor(Math.random() * 72) + 1}` : "WAITLIST"
         }));
 
-        const newTicket = await new Ticket({ 
+        // Pass session in array format for Mongoose .create()
+        const [newTicket] = await Ticket.create([{ 
             userId: req.userId, 
             trainNumber, trainName, source, destination, date, 
             passengers: detailedPassengers, totalPrice, 
             pnr: generatedPnr, 
             status: finalStatus 
-        }).save();
+        }], { session });
+
+        await session.commitTransaction(); // ✅ Success! Save permanently.
+        session.endSession();
 
         res.status(201).json({ message: "Booked Successfully!", pnr: generatedPnr, status: finalStatus, ticket: newTicket });
     } catch (error) { 
-        console.error("Booking Error:", error);
-        res.status(500).json({ error: "Booking Failed." }); 
+        await session.abortTransaction(); // 🚨 Error! Undo everything.
+        session.endSession();
+        console.error("Booking Transaction Error:", error);
+        res.status(500).json({ error: "Booking Failed due to server load." }); 
     }
 });
 
+// ==========================================
+// 6. SMART CANCELLATION & WAITLIST UPGRADE
+// ==========================================
+app.delete('/cancelTicket/:pnr', verifyToken, async (req, res) => {
+    // 🌟 FAANG FEATURE: Transactional Cancellation Engine
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const { pnr } = req.params;
+
+        // 1. Verify ticket ownership
+        const ticket = await Ticket.findOne({ pnr, userId: req.userId }).session(session);
+        if (!ticket) throw new Error("Ticket not found or unauthorized.");
+        if (ticket.status === "CANCELLED") throw new Error("Ticket is already cancelled.");
+
+        const canceledSeatCount = ticket.passengers.length;
+        const wasConfirmed = ticket.status === "CONFIRMED";
+
+        // 2. Cancellation Logic (80% Refund)
+        const refundAmount = ticket.totalPrice * 0.80;
+        ticket.status = "CANCELLED";
+        await ticket.save({ session });
+
+        // 3. Free up seats
+        await SeatInventory.findOneAndUpdate(
+            { trainNumber: ticket.trainNumber, date: ticket.date },
+            { $inc: { availableSeats: canceledSeatCount } },
+            { session }
+        );
+
+        // 4. 🚀 AUTO-UPGRADE SYSTEM (Move WL to CNF)
+        if (wasConfirmed) {
+            // Find oldest waitlist tickets for this train
+            const waitlistedTickets = await Ticket.find({
+                trainNumber: ticket.trainNumber,
+                date: ticket.date,
+                status: "WAITLIST"
+            }).sort({ bookingDate: 1 }).session(session);
+
+            let availableFreedSeats = canceledSeatCount;
+
+            for (let wlTicket of waitlistedTickets) {
+                if (availableFreedSeats <= 0) break; 
+                
+                // If group fits in available seats
+                if (wlTicket.passengers.length <= availableFreedSeats) {
+                    wlTicket.status = "CONFIRMED";
+                    wlTicket.passengers.forEach(p => {
+                        p.seatNumber = `UPGRADED-${Math.floor(Math.random() * 99)}`;
+                    });
+
+                    await wlTicket.save({ session });
+                    availableFreedSeats -= wlTicket.passengers.length;
+                }
+            }
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+
+        res.status(200).json({ 
+            message: "Ticket cancelled successfully.", 
+            refundAmount: refundAmount,
+            status: "CANCELLED"
+        });
+
+    } catch (error) {
+        await session.abortTransaction();
+        session.endSession();
+        console.error("Cancellation Transaction Failed:", error);
+        res.status(400).json({ error: error.message || "Cancellation failed." });
+    }
+});
+
+// ==========================================
+// 7. USER MANAGEMENT & AUTHENTICATION
+// ==========================================
 app.get('/myTickets', verifyToken, async (req, res) => {
     try {
         const tickets = await Ticket.find({ userId: req.userId }).sort({ bookingDate: -1 });
