@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
@@ -61,16 +62,19 @@ const User = mongoose.model('User', new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 }));
 
+// 🌟 UPGRADED TICKET SCHEMA
 const Ticket = mongoose.model('Ticket', new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     trainNumber: String, trainName: String, source: String, destination: String,
     date: String, 
     passengers: [{
-        name: String, age: Number, gender: String, seatNumber: String
+        name: String, age: Number, gender: String, seatNumber: String,
+        wlPosition: { type: Number, default: null } 
     }],
     totalPrice: Number, pnr: { type: String, unique: true },
     status: { type: String, default: 'CONFIRMED' },
-    bookingDate: { type: Date, default: Date.now }
+    bookingDate: { type: Date, default: Date.now },
+    idempotencyKey: { type: String, unique: true, sparse: true } 
 }));
 
 const Fare = mongoose.model('Fare', new mongoose.Schema({
@@ -78,10 +82,14 @@ const Fare = mongoose.model('Fare', new mongoose.Schema({
     classCode: String, totalFare: Number, distance: Number
 }));
 
+// 🌟 UPGRADED INVENTORY SCHEMA
 const SeatInventory = mongoose.model('SeatInventory', new mongoose.Schema({
     trainNumber: String,
     date: String,
-    availableSeats: { type: Number, default: 120 } 
+    totalSeats: { type: Number, default: 120 },    
+    bookedSeats: { type: Number, default: 0 },
+    waitlistCount: { type: Number, default: 0 },
+    maxWaitlist: { type: Number, default: 20 }
 }));
 
 const verifyToken = (req, res, next) => {
@@ -145,18 +153,14 @@ app.get('/searchTrains', async (req, res) => {
             let inventory = await SeatInventory.findOne({ trainNumber: train.trainNumber, date: date });
 
             if (!inventory) {
-                inventory = await SeatInventory.create({ 
-                    trainNumber: train.trainNumber, 
-                    date: date, 
-                    availableSeats: Math.floor(Math.random() * 40) + 5 
-                });
+                inventory = await SeatInventory.create({ trainNumber: train.trainNumber, date: date });
             }
 
             let statusText = "";
-            const seats = inventory.availableSeats;
+            const available = inventory.totalSeats - inventory.bookedSeats;
 
-            if (seats > 0) statusText = `AVL ${seats}`;
-            else if (seats > -20) statusText = `WL ${Math.abs(seats) + 1}`; 
+            if (available > 0) statusText = `AVL ${available}`;
+            else if (inventory.waitlistCount < inventory.maxWaitlist) statusText = `WL ${inventory.waitlistCount + 1}`; 
             else statusText = "REGRET"; 
 
             train.availability = statusText;
@@ -207,8 +211,13 @@ app.get('/pnr', async (req, res) => {
 // ==========================================
 // 5. ADVANCED BOOKING ENGINE (FAANG LEVEL)
 // ==========================================
-app.post('/bookTicket', verifyToken, async (req, res) => {
-    // 🌟 FAANG FEATURE: MongoDB Session for ACID Transactions
+app.post('/api/bookings', verifyToken, async (req, res) => {
+    const idempotencyKey = req.headers['x-idempotency-key'];
+    if (idempotencyKey) {
+        const existingTicket = await Ticket.findOne({ idempotencyKey, userId: req.userId });
+        if (existingTicket) return res.status(200).json({ message: "Booking already processed", ticket: existingTicket });
+    }
+
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -216,47 +225,59 @@ app.post('/bookTicket', verifyToken, async (req, res) => {
         const { trainNumber, trainName, source, destination, date, passengers, totalPrice } = req.body;
         const count = passengers.length;
 
-        // 🔒 LOCKING INVENTORY to prevent Race Conditions (Double Bookings)
-        const inventory = await SeatInventory.findOneAndUpdate(
-            { trainNumber, date },
-            { $inc: { availableSeats: -count } }, 
-            { new: true, upsert: true, session }
-        );
+        const inventory = await SeatInventory.findOne({ trainNumber, date }).session(session);
+        if (!inventory) throw new Error("Train inventory not found for this date.");
 
         let finalStatus = "CONFIRMED";
-        
-        if (inventory.availableSeats < 0) {
-            if (inventory.availableSeats < -20) {
-                await session.abortTransaction(); // Too full, roll back seat deduction
-                session.endSession();
-                return res.status(400).json({ error: "REGRET: Train is completely full." });
-            }
+        let startingWlPosition = null;
+
+        if (inventory.bookedSeats + count <= inventory.totalSeats) {
+            inventory.bookedSeats += count;
+        } else if (inventory.waitlistCount + count <= inventory.maxWaitlist) {
             finalStatus = "WAITLIST";
+            startingWlPosition = inventory.waitlistCount + 1;
+            inventory.waitlistCount += count;
+        } else {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(400).json({ error: "REGRET: Train and Waitlist are completely full." });
         }
 
-        const generatedPnr = Math.floor(1000000000 + Math.random() * 9000000000).toString();
-        const coachTypes = ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'B1', 'B2'];
-        
-        const detailedPassengers = passengers.map(p => ({
-            ...p,
-            seatNumber: finalStatus === "CONFIRMED" ? `${coachTypes[Math.floor(Math.random() * coachTypes.length)]} - ${Math.floor(Math.random() * 72) + 1}` : "WAITLIST"
-        }));
+        await inventory.save({ session });
 
-        // Pass session in array format for Mongoose .create()
+        const generatedPnr = crypto.randomBytes(5).toString('hex').toUpperCase();
+        const coachTypes = ['S1', 'S2', 'S3', 'S4', 'S5', 'S6'];
+        
+        let currentWlCounter = startingWlPosition;
+
+        const detailedPassengers = passengers.map(p => {
+            let pSeat = "WAITLIST";
+            let pWlPos = null;
+
+            if (finalStatus === "CONFIRMED") {
+                pSeat = `${coachTypes[Math.floor(Math.random() * coachTypes.length)]} - ${Math.floor(Math.random() * 72) + 1}`;
+            } else {
+                pWlPos = currentWlCounter++; 
+                pSeat = `WL ${pWlPos}`;
+            }
+            return { ...p, seatNumber: pSeat, wlPosition: pWlPos };
+        });
+
         const [newTicket] = await Ticket.create([{ 
             userId: req.userId, 
             trainNumber, trainName, source, destination, date, 
             passengers: detailedPassengers, totalPrice, 
             pnr: generatedPnr, 
-            status: finalStatus 
+            status: finalStatus,
+            idempotencyKey: idempotencyKey || null
         }], { session });
 
-        await session.commitTransaction(); // ✅ Success! Save permanently.
+        await session.commitTransaction();
         session.endSession();
 
         res.status(201).json({ message: "Booked Successfully!", pnr: generatedPnr, status: finalStatus, ticket: newTicket });
     } catch (error) { 
-        await session.abortTransaction(); // 🚨 Error! Undo everything.
+        await session.abortTransaction();
         session.endSession();
         console.error("Booking Transaction Error:", error);
         res.status(500).json({ error: "Booking Failed due to server load." }); 
@@ -267,14 +288,12 @@ app.post('/bookTicket', verifyToken, async (req, res) => {
 // 6. SMART CANCELLATION & WAITLIST UPGRADE
 // ==========================================
 app.delete('/cancelTicket/:pnr', verifyToken, async (req, res) => {
-    // 🌟 FAANG FEATURE: Transactional Cancellation Engine
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
         const { pnr } = req.params;
 
-        // 1. Verify ticket ownership
         const ticket = await Ticket.findOne({ pnr, userId: req.userId }).session(session);
         if (!ticket) throw new Error("Ticket not found or unauthorized.");
         if (ticket.status === "CANCELLED") throw new Error("Ticket is already cancelled.");
@@ -282,25 +301,18 @@ app.delete('/cancelTicket/:pnr', verifyToken, async (req, res) => {
         const canceledSeatCount = ticket.passengers.length;
         const wasConfirmed = ticket.status === "CONFIRMED";
 
-        // 2. Cancellation Logic (80% Refund)
         const refundAmount = ticket.totalPrice * 0.80;
         ticket.status = "CANCELLED";
         await ticket.save({ session });
 
-        // 3. Free up seats
-        await SeatInventory.findOneAndUpdate(
-            { trainNumber: ticket.trainNumber, date: ticket.date },
-            { $inc: { availableSeats: canceledSeatCount } },
-            { session }
-        );
-
-        // 4. 🚀 AUTO-UPGRADE SYSTEM (Move WL to CNF)
+        const inventory = await SeatInventory.findOne({ trainNumber: ticket.trainNumber, date: ticket.date }).session(session);
+        
         if (wasConfirmed) {
-            // Find oldest waitlist tickets for this train
+            inventory.bookedSeats -= canceledSeatCount;
+            
+            // 🚀 AUTO-UPGRADE WAITLIST QUEUE
             const waitlistedTickets = await Ticket.find({
-                trainNumber: ticket.trainNumber,
-                date: ticket.date,
-                status: "WAITLIST"
+                trainNumber: ticket.trainNumber, date: ticket.date, status: "WAITLIST"
             }).sort({ bookingDate: 1 }).session(session);
 
             let availableFreedSeats = canceledSeatCount;
@@ -308,28 +320,28 @@ app.delete('/cancelTicket/:pnr', verifyToken, async (req, res) => {
             for (let wlTicket of waitlistedTickets) {
                 if (availableFreedSeats <= 0) break; 
                 
-                // If group fits in available seats
                 if (wlTicket.passengers.length <= availableFreedSeats) {
                     wlTicket.status = "CONFIRMED";
                     wlTicket.passengers.forEach(p => {
                         p.seatNumber = `UPGRADED-${Math.floor(Math.random() * 99)}`;
+                        p.wlPosition = null;
                     });
 
                     await wlTicket.save({ session });
+                    inventory.bookedSeats += wlTicket.passengers.length;
+                    inventory.waitlistCount -= wlTicket.passengers.length;
                     availableFreedSeats -= wlTicket.passengers.length;
                 }
             }
+        } else {
+            inventory.waitlistCount -= canceledSeatCount;
         }
 
+        await inventory.save({ session });
         await session.commitTransaction();
         session.endSession();
 
-        res.status(200).json({ 
-            message: "Ticket cancelled successfully.", 
-            refundAmount: refundAmount,
-            status: "CANCELLED"
-        });
-
+        res.status(200).json({ message: "Ticket cancelled successfully.", refundAmount: refundAmount, status: "CANCELLED" });
     } catch (error) {
         await session.abortTransaction();
         session.endSession();
@@ -382,11 +394,9 @@ app.post('/login', async (req, res) => {
 });
 
 app.post('/auth/google', async (req, res) => {
-    console.log("\n--- 🔍 NEW GOOGLE LOGIN ATTEMPT ---");
     try {
         const ticket = await googleClient.verifyIdToken({ idToken: req.body.idToken, audience: process.env.GOOGLE_CLIENT_ID });
         const { email, name } = ticket.getPayload();
-        console.log("✅ Token Verified by Google for:", email);
         
         let user = await User.findOne({ email });
         if (!user) {
@@ -396,7 +406,7 @@ app.post('/auth/google', async (req, res) => {
         const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, user: { name: user.name, email: user.email } });
     } catch (e) { 
-        console.error("🚨 GOOGLE REJECTED IT BECAUSE:", e.message);
+        console.error("🚨 GOOGLE REJECTED IT:", e.message);
         res.status(401).json({ error: "Google Auth Failed." }); 
     }
 });
