@@ -17,7 +17,8 @@ const PORT = process.env.PORT || 5000;
 
 // 🚀 UPGRADE 1: Master Process spins up Workers (1 per CPU core)
 if (cluster.isPrimary) {
-    const numCPUs = os.cpus().length;
+    // Caps workers to 1 on Render's free tier to prevent Out of Memory crashes
+    const numCPUs = process.env.WEB_CONCURRENCY || 1;
     console.log(`🚀 Master process ${process.pid} is running`);
     console.log(`🚀 Forking ${numCPUs} worker processes to utilize all CPU cores...`);
 
