@@ -84,7 +84,7 @@ if (cluster.isPrimary) {
         createdAt: { type: Date, default: Date.now }
     });
     // 🚀 UPGRADE 2: MongoDB Indexing
-    userSchema.index({ email: 1 });
+    
     const User = mongoose.model('User', userSchema);
 
     const ticketSchema = new mongoose.Schema({
